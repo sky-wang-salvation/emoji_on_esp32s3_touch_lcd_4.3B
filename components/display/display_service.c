@@ -47,8 +47,8 @@ static const char *TAG = "display_service";
 #define DISPLAY_BLINK_SINGLE_US         (180LL * 1000LL)
 #define DISPLAY_BLINK_GAP_US            (90LL * 1000LL)
 #define DISPLAY_POSE_LERP_DIV           4
-#define DISPLAY_FACE_SHIFT_PX           34
-#define DISPLAY_FACE_SHIFT_STEP_PX      8
+#define DISPLAY_FACE_SHIFT_PX           30
+#define DISPLAY_FACE_SHIFT_STEP_PX      6
 #define DISPLAY_EYE_LEFT_CENTER_X       230
 #define DISPLAY_EYE_RIGHT_CENTER_X      570
 #define DISPLAY_EYE_BASE_CENTER_Y       210
