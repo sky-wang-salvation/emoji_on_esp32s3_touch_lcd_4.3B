@@ -47,7 +47,8 @@ static const char *TAG = "display_service";
 #define DISPLAY_BLINK_SINGLE_US         (180LL * 1000LL)
 #define DISPLAY_BLINK_GAP_US            (90LL * 1000LL)
 #define DISPLAY_POSE_LERP_DIV           4
-#define DISPLAY_GAZE_SHIFT_PX           46
+#define DISPLAY_FACE_SHIFT_PX           34
+#define DISPLAY_FACE_SHIFT_STEP_PX      8
 #define DISPLAY_EYE_LEFT_CENTER_X       230
 #define DISPLAY_EYE_RIGHT_CENTER_X      570
 #define DISPLAY_EYE_BASE_CENTER_Y       210
@@ -81,12 +82,9 @@ static esp_lcd_panel_handle_t s_panel_handle;
 static esp_lcd_panel_io_handle_t s_touch_io_handle;
 static esp_lcd_touch_handle_t s_touch_handle;
 static lv_display_t *s_display;
+static lv_obj_t *s_face_root;
 static lv_obj_t *s_left_eye;
 static lv_obj_t *s_right_eye;
-static lv_obj_t *s_left_shade;
-static lv_obj_t *s_right_shade;
-static lv_obj_t *s_left_glint;
-static lv_obj_t *s_right_glint;
 static lv_obj_t *s_left_cheek;
 static lv_obj_t *s_right_cheek;
 static lv_obj_t *s_mouth_line;
@@ -160,13 +158,8 @@ typedef struct {
     int32_t eye_width;
     int32_t left_eye_height;
     int32_t right_eye_height;
-    int32_t gaze_offset_x;
-    int32_t glint_width;
-    int32_t glint_height;
-    int32_t glint_center_y_offset;
-    int32_t glint_opa;
+    int32_t face_offset_x;
     int32_t cheek_opa;
-    int32_t shade_opa;
     int32_t mouth_dot_width;
     int32_t mouth_dot_height;
     int32_t mouth_dot_opa;
@@ -300,11 +293,6 @@ static int64_t display_service_random_range_us(int64_t min_us, int64_t max_us)
     return min_us + ((int64_t)(esp_random() % (uint32_t)(max_us - min_us)));
 }
 
-static int32_t display_service_abs_i32(int32_t value)
-{
-    return (value < 0) ? -value : value;
-}
-
 static int32_t display_service_step_value(int32_t current, int32_t target, int32_t divisor)
 {
     int32_t delta = target - current;
@@ -319,6 +307,22 @@ static int32_t display_service_step_value(int32_t current, int32_t target, int32
     }
 
     return current + step;
+}
+
+static int32_t display_service_step_value_limited(int32_t current, int32_t target, int32_t max_step)
+{
+    int32_t delta = target - current;
+
+    if ((delta == 0) || (max_step <= 0)) {
+        return target;
+    }
+    if (delta > max_step) {
+        return current + max_step;
+    }
+    if (delta < -max_step) {
+        return current - max_step;
+    }
+    return target;
 }
 
 static void display_service_apply_touch_zone_locked(display_touch_zone_t zone, int64_t now)
@@ -568,37 +572,6 @@ static void display_service_style_rect(lv_obj_t *obj, lv_coord_t w, lv_coord_t h
     lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
 }
 
-static void display_service_style_glow_border(lv_obj_t *obj,
-                                              lv_color_t color,
-                                              lv_opa_t opa,
-                                              lv_coord_t border_width,
-                                              lv_opa_t border_opa)
-{
-    lv_obj_set_style_border_width(obj, border_width, LV_PART_MAIN);
-    lv_obj_set_style_border_color(obj, lv_color_mix(lv_color_white(), color, LV_OPA_30), LV_PART_MAIN);
-    lv_obj_set_style_border_opa(obj, LV_MIN(opa, border_opa), LV_PART_MAIN);
-}
-
-static void display_service_style_cover(lv_obj_t *obj,
-                                        lv_coord_t x,
-                                        lv_coord_t y,
-                                        lv_coord_t w,
-                                        lv_coord_t h,
-                                        lv_coord_t radius,
-                                        lv_color_t color,
-                                        lv_opa_t opa)
-{
-    if (opa == LV_OPA_TRANSP) {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-
-    display_service_style_rect(obj, w, h, radius, color, opa);
-    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
-    lv_obj_set_pos(obj, x, y);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
-}
-
 static void display_service_style_mouth_dot(lv_obj_t *obj,
                                             lv_coord_t x,
                                             lv_coord_t y,
@@ -613,10 +586,6 @@ static void display_service_style_mouth_dot(lv_obj_t *obj,
     }
 
     display_service_style_rect(obj, w, h, h / 2, color, opa);
-    display_service_style_glow_border(obj, color, opa, 2, LV_OPA_70);
-    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_spread(obj, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_pos(obj, x, y);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
@@ -640,27 +609,6 @@ static void display_service_style_eye(lv_obj_t *obj,
                                LV_MIN(DISPLAY_EYE_RADIUS, LV_MIN(w / 2, h / 2)),
                                color,
                                opa);
-    display_service_style_glow_border(obj, color, opa, 3, LV_OPA_80);
-    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_spread(obj, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_pos(obj, x, y);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void display_service_style_glint(lv_obj_t *obj,
-                                        lv_coord_t x,
-                                        lv_coord_t y,
-                                        lv_coord_t w,
-                                        lv_coord_t h,
-                                        lv_opa_t opa)
-{
-    if (opa == LV_OPA_TRANSP) {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-
-    display_service_style_rect(obj, w, h, LV_MIN(w, h) / 2, lv_color_hex(0xFFFFFF), opa);
     lv_obj_set_pos(obj, x, y);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
@@ -673,9 +621,6 @@ static void display_service_style_cheek(lv_obj_t *obj, lv_coord_t x, lv_coord_t 
     }
 
     display_service_style_rect(obj, 116, 40, 20, lv_color_hex(0xFF6B9D), opa);
-    display_service_style_glow_border(obj, lv_color_hex(0xFF6B9D), opa, 1, LV_OPA_60);
-    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_pos(obj, x, y);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
@@ -729,13 +674,8 @@ static void display_service_expression_defaults(display_expression_t *expr, lv_c
     expr->eye_width = DISPLAY_EYE_BASE_W;
     expr->left_eye_height = DISPLAY_EYE_BASE_H;
     expr->right_eye_height = DISPLAY_EYE_BASE_H;
-    expr->gaze_offset_x = 0;
-    expr->glint_width = 42;
-    expr->glint_height = 32;
-    expr->glint_center_y_offset = -46;
-    expr->glint_opa = LV_OPA_40;
+    expr->face_offset_x = 0;
     expr->cheek_opa = LV_OPA_TRANSP;
-    expr->shade_opa = LV_OPA_TRANSP;
     expr->mouth_dot_width = 104;
     expr->mouth_dot_height = 42;
     expr->mouth_dot_opa = LV_OPA_TRANSP;
@@ -756,7 +696,6 @@ static void display_service_fill_expression_locked(display_face_t face, display_
         expr->eye_center_y = 230;
         expr->left_eye_height = 72;
         expr->right_eye_height = 72;
-        expr->glint_opa = LV_OPA_TRANSP;
         expr->cheek_opa = 82;
         expr->mouth = DISPLAY_MOUTH_WAVE;
         break;
@@ -765,9 +704,6 @@ static void display_service_fill_expression_locked(display_face_t face, display_
         expr->eye_width = 126;
         expr->left_eye_height = 176;
         expr->right_eye_height = 176;
-        expr->glint_width = 44;
-        expr->glint_height = 34;
-        expr->glint_center_y_offset = -40;
         expr->mouth = DISPLAY_MOUTH_NONE;
         expr->mouth_dot_width = 104;
         expr->mouth_dot_height = 42;
@@ -777,18 +713,11 @@ static void display_service_fill_expression_locked(display_face_t face, display_
         expr->eye_width = 124;
         expr->left_eye_height = 144;
         expr->right_eye_height = 144;
-        expr->glint_width = 34;
-        expr->glint_height = 26;
-        expr->glint_center_y_offset = -36;
         expr->mouth = DISPLAY_MOUTH_WAVE;
         break;
     case DISPLAY_FACE_PROCESSING:
         expr->left_eye_height = 118;
         expr->right_eye_height = 118;
-        expr->glint_width = 28;
-        expr->glint_height = 20;
-        expr->glint_center_y_offset = -20;
-        expr->glint_opa = LV_OPA_30;
         expr->mouth = DISPLAY_MOUTH_FLAT;
         break;
     case DISPLAY_FACE_SPEAKING:
@@ -801,16 +730,10 @@ static void display_service_fill_expression_locked(display_face_t face, display_
         expr->mouth_dot_opa = LV_OPA_COVER;
         break;
     case DISPLAY_FACE_LOOK_LEFT:
-        expr->gaze_offset_x = -DISPLAY_GAZE_SHIFT_PX;
-        expr->glint_width = 34;
-        expr->glint_height = 28;
-        expr->shade_opa = 140;
+        expr->face_offset_x = -DISPLAY_FACE_SHIFT_PX;
         break;
     case DISPLAY_FACE_LOOK_RIGHT:
-        expr->gaze_offset_x = DISPLAY_GAZE_SHIFT_PX;
-        expr->glint_width = 34;
-        expr->glint_height = 28;
-        expr->shade_opa = 140;
+        expr->face_offset_x = DISPLAY_FACE_SHIFT_PX;
         break;
     case DISPLAY_FACE_BLINK:
         expr->mouth = DISPLAY_MOUTH_BLINK;
@@ -818,12 +741,10 @@ static void display_service_fill_expression_locked(display_face_t face, display_
     case DISPLAY_FACE_SLEEP:
         expr->left_eye_height = 20;
         expr->right_eye_height = 20;
-        expr->glint_opa = LV_OPA_TRANSP;
         expr->mouth = DISPLAY_MOUTH_NONE;
         expr->sleep_opa = LV_OPA_COVER;
         break;
     case DISPLAY_FACE_ERROR:
-        expr->glint_opa = LV_OPA_TRANSP;
         expr->mouth = DISPLAY_MOUTH_FROWN;
         expr->eye_color = red;
         break;
@@ -846,13 +767,10 @@ static void display_service_step_expression_locked(const display_expression_t *t
     s_current_expression.eye_width = display_service_step_value(s_current_expression.eye_width, target->eye_width, DISPLAY_POSE_LERP_DIV);
     s_current_expression.left_eye_height = display_service_step_value(s_current_expression.left_eye_height, target->left_eye_height, DISPLAY_POSE_LERP_DIV);
     s_current_expression.right_eye_height = display_service_step_value(s_current_expression.right_eye_height, target->right_eye_height, DISPLAY_POSE_LERP_DIV);
-    s_current_expression.gaze_offset_x = display_service_step_value(s_current_expression.gaze_offset_x, target->gaze_offset_x, DISPLAY_POSE_LERP_DIV);
-    s_current_expression.glint_width = display_service_step_value(s_current_expression.glint_width, target->glint_width, DISPLAY_POSE_LERP_DIV);
-    s_current_expression.glint_height = display_service_step_value(s_current_expression.glint_height, target->glint_height, DISPLAY_POSE_LERP_DIV);
-    s_current_expression.glint_center_y_offset = display_service_step_value(s_current_expression.glint_center_y_offset, target->glint_center_y_offset, DISPLAY_POSE_LERP_DIV);
-    s_current_expression.glint_opa = display_service_step_value(s_current_expression.glint_opa, target->glint_opa, DISPLAY_POSE_LERP_DIV);
+    s_current_expression.face_offset_x = display_service_step_value_limited(s_current_expression.face_offset_x,
+                                                                            target->face_offset_x,
+                                                                            DISPLAY_FACE_SHIFT_STEP_PX);
     s_current_expression.cheek_opa = display_service_step_value(s_current_expression.cheek_opa, target->cheek_opa, DISPLAY_POSE_LERP_DIV);
-    s_current_expression.shade_opa = display_service_step_value(s_current_expression.shade_opa, target->shade_opa, DISPLAY_POSE_LERP_DIV);
     s_current_expression.mouth_dot_width = display_service_step_value(s_current_expression.mouth_dot_width, target->mouth_dot_width, DISPLAY_POSE_LERP_DIV);
     s_current_expression.mouth_dot_height = display_service_step_value(s_current_expression.mouth_dot_height, target->mouth_dot_height, DISPLAY_POSE_LERP_DIV);
     s_current_expression.mouth_dot_opa = display_service_step_value(s_current_expression.mouth_dot_opa, target->mouth_dot_opa, DISPLAY_POSE_LERP_DIV);
@@ -878,16 +796,8 @@ static void display_service_apply_face_locked(display_face_t face, int64_t now)
     int32_t right_eye_x = DISPLAY_EYE_RIGHT_CENTER_X - (s_current_expression.eye_width / 2);
     int32_t left_eye_y = s_current_expression.eye_center_y - (left_eye_height_blinked / 2);
     int32_t right_eye_y = s_current_expression.eye_center_y - (right_eye_height_blinked / 2);
-    int32_t glint_left_opa = (s_current_expression.glint_opa * left_blink_open) / 1000;
-    int32_t glint_right_opa = (s_current_expression.glint_opa * right_blink_open) / 1000;
-    int32_t glint_center_y = s_current_expression.eye_center_y + s_current_expression.glint_center_y_offset;
-    int32_t left_glint_center_x = DISPLAY_EYE_LEFT_CENTER_X + s_current_expression.gaze_offset_x + (s_current_expression.eye_width * 22 / 100);
-    int32_t right_glint_center_x = DISPLAY_EYE_RIGHT_CENTER_X + s_current_expression.gaze_offset_x + (s_current_expression.eye_width * 22 / 100);
-    int32_t shade_width = lv_map(display_service_abs_i32(s_current_expression.gaze_offset_x),
-                                 0,
-                                 DISPLAY_GAZE_SHIFT_PX,
-                                 0,
-                                 LV_MAX(0, s_current_expression.eye_width - 28));
+
+    lv_obj_set_pos(s_face_root, s_current_expression.face_offset_x, 0);
 
     display_service_style_eye(s_left_eye,
                               left_eye_x,
@@ -903,58 +813,6 @@ static void display_service_apply_face_locked(display_face_t face, int64_t now)
                               right_eye_height_blinked,
                               s_current_expression.eye_color,
                               LV_OPA_COVER);
-
-    display_service_style_glint(s_left_glint,
-                                left_glint_center_x - (s_current_expression.glint_width / 2),
-                                glint_center_y - (s_current_expression.glint_height / 2),
-                                s_current_expression.glint_width,
-                                s_current_expression.glint_height,
-                                (lv_opa_t)glint_left_opa);
-    display_service_style_glint(s_right_glint,
-                                right_glint_center_x - (s_current_expression.glint_width / 2),
-                                glint_center_y - (s_current_expression.glint_height / 2),
-                                s_current_expression.glint_width,
-                                s_current_expression.glint_height,
-                                (lv_opa_t)glint_right_opa);
-
-    if (s_current_expression.gaze_offset_x < -6) {
-        display_service_style_cover(s_left_shade,
-                                    left_eye_x + s_current_expression.eye_width - shade_width,
-                                    left_eye_y,
-                                    shade_width,
-                                    left_eye_height_blinked,
-                                    DISPLAY_EYE_RADIUS,
-                                    lv_color_hex(0x000000),
-                                    (lv_opa_t)s_current_expression.shade_opa);
-        display_service_style_cover(s_right_shade,
-                                    right_eye_x + s_current_expression.eye_width - shade_width,
-                                    right_eye_y,
-                                    shade_width,
-                                    right_eye_height_blinked,
-                                    DISPLAY_EYE_RADIUS,
-                                    lv_color_hex(0x000000),
-                                    (lv_opa_t)s_current_expression.shade_opa);
-    } else if (s_current_expression.gaze_offset_x > 6) {
-        display_service_style_cover(s_left_shade,
-                                    left_eye_x,
-                                    left_eye_y,
-                                    shade_width,
-                                    left_eye_height_blinked,
-                                    DISPLAY_EYE_RADIUS,
-                                    lv_color_hex(0x000000),
-                                    (lv_opa_t)s_current_expression.shade_opa);
-        display_service_style_cover(s_right_shade,
-                                    right_eye_x,
-                                    right_eye_y,
-                                    shade_width,
-                                    right_eye_height_blinked,
-                                    DISPLAY_EYE_RADIUS,
-                                    lv_color_hex(0x000000),
-                                    (lv_opa_t)s_current_expression.shade_opa);
-    } else {
-        lv_obj_add_flag(s_left_shade, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_right_shade, LV_OBJ_FLAG_HIDDEN);
-    }
 
     display_service_style_cheek(s_left_cheek, 104, 280, (lv_opa_t)s_current_expression.cheek_opa);
     display_service_style_cheek(s_right_cheek, 580, 280, (lv_opa_t)s_current_expression.cheek_opa);
@@ -1307,30 +1165,27 @@ static void display_service_create_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
-    s_left_eye = lv_obj_create(scr);
-    s_right_eye = lv_obj_create(scr);
-    s_left_shade = lv_obj_create(scr);
-    s_right_shade = lv_obj_create(scr);
-    s_left_glint = lv_obj_create(scr);
-    s_right_glint = lv_obj_create(scr);
-    s_left_cheek = lv_obj_create(scr);
-    s_right_cheek = lv_obj_create(scr);
-    s_mouth_line = lv_line_create(scr);
-    s_mouth_dot = lv_obj_create(scr);
+    s_face_root = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_face_root);
+    lv_obj_set_size(s_face_root, DISPLAY_H_RES, DISPLAY_V_RES);
+    lv_obj_set_pos(s_face_root, 0, 0);
+    lv_obj_clear_flag(s_face_root, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_left_eye = lv_obj_create(s_face_root);
+    s_right_eye = lv_obj_create(s_face_root);
+    s_left_cheek = lv_obj_create(s_face_root);
+    s_right_cheek = lv_obj_create(s_face_root);
+    s_mouth_line = lv_line_create(s_face_root);
+    s_mouth_dot = lv_obj_create(s_face_root);
     s_sleep_label = lv_label_create(scr);
 
     lv_obj_add_flag(s_left_cheek, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_right_cheek, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_left_shade, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_right_shade, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_mouth_dot, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_sleep_label, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_set_style_bg_opa(s_left_eye, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_right_eye, LV_OPA_COVER, LV_PART_MAIN);
-
-    lv_obj_set_style_bg_opa(s_left_glint, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_right_glint, LV_OPA_COVER, LV_PART_MAIN);
 
     lv_label_set_text(s_sleep_label, "Z z");
     lv_obj_set_style_text_color(s_sleep_label, lv_color_hex(0xA78BFA), LV_PART_MAIN);
