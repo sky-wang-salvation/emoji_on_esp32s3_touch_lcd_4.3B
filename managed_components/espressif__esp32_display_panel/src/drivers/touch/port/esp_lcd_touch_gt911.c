@@ -141,7 +141,11 @@ esp_err_t esp_lcd_touch_new_i2c_gt911(const esp_lcd_panel_io_handle_t io, const 
 
         vTaskDelay(pdMS_TO_TICKS(50));
     } else {
-        ESP_LOGW(TAG, "Unable to initialize the I2C address");
+        if (gt911_config) {
+            ESP_LOGI(TAG, "Skip internal I2C address init, using preselected address 0x%02X", gt911_config->dev_addr);
+        } else {
+            ESP_LOGW(TAG, "Unable to initialize the I2C address");
+        }
         /* Reset controller */
         ret = touch_gt911_reset(esp_lcd_touch_gt911);
         ESP_GOTO_ON_ERROR(ret, err, TAG, "GT911 reset failed");

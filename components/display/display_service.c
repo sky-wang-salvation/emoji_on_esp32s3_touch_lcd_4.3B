@@ -98,6 +98,9 @@ static lv_obj_t *s_touch_label;
 static bool s_display_ready;
 static bool s_i2c_ready;
 static bool s_touch_ready;
+static esp_lcd_touch_io_gt911_config_t s_touch_gt911_driver_cfg = {
+    .dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS,
+};
 static int64_t s_last_interaction_us;
 static int64_t s_touch_press_started_us;
 static int64_t s_touch_face_expire_us;
@@ -179,6 +182,8 @@ static display_blink_pattern_t s_blink_pattern = DISPLAY_BLINK_PATTERN_BOTH;
 static uint8_t s_blink_repeat_count = 0;
 static bool s_expression_ready;
 static display_expression_t s_current_expression;
+static display_face_t s_last_status_face = DISPLAY_FACE_NONE;
+static robot_state_t s_last_status_state = ROBOT_STATE_BOOTING;
 
 static lv_point_t s_runtime_mouth_points[5];
 
@@ -563,6 +568,17 @@ static void display_service_style_rect(lv_obj_t *obj, lv_coord_t w, lv_coord_t h
     lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
 }
 
+static void display_service_style_glow_border(lv_obj_t *obj,
+                                              lv_color_t color,
+                                              lv_opa_t opa,
+                                              lv_coord_t border_width,
+                                              lv_opa_t border_opa)
+{
+    lv_obj_set_style_border_width(obj, border_width, LV_PART_MAIN);
+    lv_obj_set_style_border_color(obj, lv_color_mix(lv_color_white(), color, LV_OPA_30), LV_PART_MAIN);
+    lv_obj_set_style_border_opa(obj, LV_MIN(opa, border_opa), LV_PART_MAIN);
+}
+
 static void display_service_style_cover(lv_obj_t *obj,
                                         lv_coord_t x,
                                         lv_coord_t y,
@@ -597,10 +613,10 @@ static void display_service_style_mouth_dot(lv_obj_t *obj,
     }
 
     display_service_style_rect(obj, w, h, h / 2, color, opa);
-    lv_obj_set_style_shadow_width(obj, 22, LV_PART_MAIN);
+    display_service_style_glow_border(obj, color, opa, 2, LV_OPA_70);
+    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
     lv_obj_set_style_shadow_spread(obj, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_color(obj, color, LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_pos(obj, x, y);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
@@ -624,10 +640,10 @@ static void display_service_style_eye(lv_obj_t *obj,
                                LV_MIN(DISPLAY_EYE_RADIUS, LV_MIN(w / 2, h / 2)),
                                color,
                                opa);
-    lv_obj_set_style_shadow_width(obj, 36, LV_PART_MAIN);
-    lv_obj_set_style_shadow_spread(obj, 2, LV_PART_MAIN);
-    lv_obj_set_style_shadow_color(obj, color, LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(obj, LV_OPA_40, LV_PART_MAIN);
+    display_service_style_glow_border(obj, color, opa, 3, LV_OPA_80);
+    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_spread(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_pos(obj, x, y);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
@@ -657,9 +673,9 @@ static void display_service_style_cheek(lv_obj_t *obj, lv_coord_t x, lv_coord_t 
     }
 
     display_service_style_rect(obj, 116, 40, 20, lv_color_hex(0xFF6B9D), opa);
-    lv_obj_set_style_shadow_width(obj, 18, LV_PART_MAIN);
-    lv_obj_set_style_shadow_color(obj, lv_color_hex(0xFF6B9D), LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_MAIN);
+    display_service_style_glow_border(obj, lv_color_hex(0xFF6B9D), opa, 1, LV_OPA_60);
+    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_pos(obj, x, y);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1121,7 +1137,8 @@ static esp_err_t display_service_touch_init(void)
     esp_err_t err = display_service_touch_reset();
     ESP_RETURN_ON_ERROR(err, TAG, "display_service_touch_reset failed");
 
-    esp_lcd_panel_io_i2c_config_t touch_io_config = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
+    esp_lcd_panel_io_i2c_config_t touch_io_config =
+        ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG_WITH_ADDR(s_touch_gt911_driver_cfg.dev_addr);
     err = esp_lcd_new_panel_io_i2c((esp_lcd_i2c_bus_handle_t)DISPLAY_I2C_PORT,
                                    &touch_io_config,
                                    &s_touch_io_handle);
@@ -1136,6 +1153,7 @@ static esp_err_t display_service_touch_init(void)
             .reset = 0,
             .interrupt = 0,
         },
+        .driver_data = &s_touch_gt911_driver_cfg,
         .flags = {
             .swap_xy = 0,
             .mirror_x = 0,
@@ -1146,6 +1164,7 @@ static esp_err_t display_service_touch_init(void)
     ESP_RETURN_ON_ERROR(err, TAG, "esp_lcd_touch_new_i2c_gt911 failed");
 
     s_touch_ready = true;
+    ESP_LOGI(TAG, "GT911 address preselected by board reset: 0x%02X", s_touch_gt911_driver_cfg.dev_addr);
     ESP_LOGI(TAG, "Touch controller GT911 initialized");
     return ESP_OK;
 }
@@ -1272,12 +1291,14 @@ static void display_service_update_ui_locked(robot_state_t state, int64_t now)
     display_face_t face = display_service_visual_face_from_state(state, now);
 
     display_service_apply_face_locked(face, now);
-    lv_label_set_text_fmt(s_state_label,
-                          "Face: %s | Link: %s",
-                          display_service_face_name(face),
-                          emotion_engine_state_name(state));
-    lv_label_set_text(s_hint_label,
-                      "TL=lookL TM=shy TR=lookR | ML=listen MM=happy MR=proc | BL=blink BM=speak BR=sleep | Hold=excited");
+    if ((face != s_last_status_face) || (state != s_last_status_state)) {
+        lv_label_set_text_fmt(s_state_label,
+                              "Face: %s | Link: %s",
+                              display_service_face_name(face),
+                              emotion_engine_state_name(state));
+        s_last_status_face = face;
+        s_last_status_state = state;
+    }
 }
 
 static void display_service_create_ui(void)
