@@ -1,6 +1,9 @@
 #include "include/display_service.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -55,6 +58,27 @@ static const char *TAG = "display_service";
 #define DISPLAY_EYE_BASE_W              120
 #define DISPLAY_EYE_BASE_H              160
 #define DISPLAY_EYE_RADIUS              52
+#define DISPLAY_STARTUP_SLEEP_HOLD_US   (2000LL * 1000LL)
+#define DISPLAY_STARTUP_PEEK_US         (380LL * 1000LL)
+#define DISPLAY_STARTUP_HALF_REVEAL_US  (520LL * 1000LL)
+#define DISPLAY_STARTUP_FULL_REVEAL_US  (700LL * 1000LL)
+#define DISPLAY_STARTUP_DROP_US         (1500LL * 1000LL)
+#define DISPLAY_TOUCH_POLL_INTERVAL_US  (24LL * 1000LL)
+#define DISPLAY_ACTIVE_RENDER_INTERVAL_US (16LL * 1000LL)
+#define DISPLAY_RENDER_HEARTBEAT_US     (120LL * 1000LL)
+#define DISPLAY_MOMO_PIXEL_SIZE         6
+#define DISPLAY_MOMO_GRID_W             12
+#define DISPLAY_MOMO_GRID_H             12
+#define DISPLAY_MOMO_WIDTH              (DISPLAY_MOMO_GRID_W * DISPLAY_MOMO_PIXEL_SIZE)
+#define DISPLAY_MOMO_HEIGHT             (DISPLAY_MOMO_GRID_H * DISPLAY_MOMO_PIXEL_SIZE)
+#define DISPLAY_MOMO_PEEK_VISIBLE_PX    10
+#define DISPLAY_MOMO_HALF_VISIBLE_PX    (DISPLAY_MOMO_HEIGHT / 2)
+#define DISPLAY_MOMO_FULL_Y             18
+#define DISPLAY_MOMO_EXIT_Y             (DISPLAY_V_RES + 12)
+#define DISPLAY_MOMO_X                  ((DISPLAY_H_RES - DISPLAY_MOMO_WIDTH) / 2)
+#define DISPLAY_MOMO_HIDDEN_Y           (-DISPLAY_MOMO_HEIGHT)
+#define DISPLAY_MOMO_PEEK_Y             (DISPLAY_MOMO_PEEK_VISIBLE_PX - DISPLAY_MOMO_HEIGHT)
+#define DISPLAY_MOMO_HALF_Y             (DISPLAY_MOMO_HALF_VISIBLE_PX - DISPLAY_MOMO_HEIGHT)
 
 #define DISPLAY_GPIO_VSYNC              GPIO_NUM_3
 #define DISPLAY_GPIO_HSYNC              GPIO_NUM_46
@@ -93,6 +117,14 @@ static lv_obj_t *s_sleep_label;
 static lv_obj_t *s_state_label;
 static lv_obj_t *s_hint_label;
 static lv_obj_t *s_touch_label;
+static lv_obj_t *s_momo_root;
+static lv_obj_t *s_momo_left_eye;
+static lv_obj_t *s_momo_right_eye;
+static lv_obj_t *s_momo_left_glint;
+static lv_obj_t *s_momo_right_glint;
+static lv_obj_t *s_momo_mouth;
+static lv_obj_t *s_momo_left_blush;
+static lv_obj_t *s_momo_right_blush;
 static bool s_display_ready;
 static bool s_i2c_ready;
 static bool s_touch_ready;
@@ -107,8 +139,18 @@ static int64_t s_next_gaze_us;
 static int64_t s_next_blink_us;
 static int64_t s_blink_started_us;
 static int64_t s_blink_total_us;
+static int64_t s_startup_sequence_start_us;
 static bool s_touch_pressed;
 static bool s_long_press_triggered;
+static bool s_startup_sequence_done;
+static lv_coord_t s_momo_last_y = LV_COORD_MIN;
+static int32_t s_momo_last_face = -1;
+static int64_t s_next_touch_poll_us;
+static bool s_touch_sample_valid;
+static bool s_touch_sample_pressed;
+static uint16_t s_touch_sample_x;
+static uint16_t s_touch_sample_y;
+static uint8_t s_touch_sample_points;
 
 typedef enum {
     DISPLAY_TOUCH_ZONE_NONE = 0,
@@ -153,6 +195,15 @@ typedef enum {
     DISPLAY_BLINK_PATTERN_RIGHT,
 } display_blink_pattern_t;
 
+typedef enum {
+    DISPLAY_MOMO_FACE_SLEEP = 0,
+    DISPLAY_MOMO_FACE_CURIOUS,
+    DISPLAY_MOMO_FACE_SHY,
+    DISPLAY_MOMO_FACE_SURPRISED,
+    DISPLAY_MOMO_FACE_HAPPY,
+    DISPLAY_MOMO_FACE_BLINK,
+} display_momo_face_t;
+
 typedef struct {
     int32_t eye_center_y;
     int32_t eye_width;
@@ -168,6 +219,33 @@ typedef struct {
     lv_color_t eye_color;
 } display_expression_t;
 
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int16_t w;
+    int16_t h;
+    uint32_t color_hex;
+} display_pixel_block_t;
+
+typedef struct {
+    lv_coord_t x;
+    lv_coord_t y;
+    lv_coord_t w;
+    lv_coord_t h;
+    lv_coord_t radius;
+    uint32_t color32;
+    lv_opa_t opa;
+    bool hidden;
+    bool initialized;
+} display_rect_cache_t;
+
+typedef struct {
+    display_mouth_t mouth;
+    uint32_t color32;
+    bool hidden;
+    bool initialized;
+} display_mouth_cache_t;
+
 static display_face_t s_touch_face = DISPLAY_FACE_NONE;
 static display_face_t s_auto_face = DISPLAY_FACE_NONE;
 static display_touch_zone_t s_touch_active_zone = DISPLAY_TOUCH_ZONE_NONE;
@@ -177,6 +255,19 @@ static bool s_expression_ready;
 static display_expression_t s_current_expression;
 static display_face_t s_last_status_face = DISPLAY_FACE_NONE;
 static robot_state_t s_last_status_state = ROBOT_STATE_BOOTING;
+static int64_t s_next_render_due_us;
+static display_rect_cache_t s_left_eye_cache;
+static display_rect_cache_t s_right_eye_cache;
+static display_rect_cache_t s_left_cheek_cache;
+static display_rect_cache_t s_right_cheek_cache;
+static display_rect_cache_t s_mouth_dot_cache;
+static display_mouth_cache_t s_mouth_cache;
+static lv_coord_t s_face_root_last_x = LV_COORD_MIN;
+static int32_t s_sleep_label_last_opa = -1;
+static bool s_sleep_label_hidden = true;
+static char s_touch_label_text[64];
+static int32_t s_last_left_blink_open = -1;
+static int32_t s_last_right_blink_open = -1;
 
 static lv_point_t s_runtime_mouth_points[5];
 
@@ -207,17 +298,59 @@ static const lv_point_t s_blink_points[] = {
     {458, 332},
 };
 
+static const display_pixel_block_t s_momo_body_blocks[] = {
+    {3, 0, 2, 1, 0xC27A9C},
+    {7, 0, 2, 1, 0xC27A9C},
+    {2, 1, 1, 1, 0xC27A9C},
+    {3, 1, 2, 1, 0xF4C8D8},
+    {7, 1, 2, 1, 0xF4C8D8},
+    {9, 1, 1, 1, 0xC27A9C},
+    {1, 2, 1, 1, 0xC27A9C},
+    {2, 2, 8, 1, 0xF4C8D8},
+    {10, 2, 1, 1, 0xC27A9C},
+    {0, 3, 1, 4, 0xC27A9C},
+    {1, 3, 10, 4, 0xF4C8D8},
+    {11, 3, 1, 4, 0xC27A9C},
+    {1, 7, 10, 2, 0xF4C8D8},
+    {2, 9, 3, 2, 0xF4C8D8},
+    {7, 9, 3, 2, 0xF4C8D8},
+    {2, 11, 1, 1, 0xC27A9C},
+    {4, 10, 1, 1, 0xC27A9C},
+    {7, 10, 1, 1, 0xC27A9C},
+    {9, 11, 1, 1, 0xC27A9C},
+};
+
 static void display_service_style_rect(lv_obj_t *obj,
                                        lv_coord_t w,
                                        lv_coord_t h,
                                        lv_coord_t radius,
                                        lv_color_t color,
                                        lv_opa_t opa);
+static void display_service_style_rect_cached(lv_obj_t *obj,
+                                              display_rect_cache_t *cache,
+                                              lv_coord_t x,
+                                              lv_coord_t y,
+                                              lv_coord_t w,
+                                              lv_coord_t h,
+                                              lv_coord_t radius,
+                                              lv_color_t color,
+                                              lv_opa_t opa);
+static void display_service_style_mouth_cached(display_mouth_t mouth, lv_color_t color);
+static void display_service_set_touch_label_locked(const char *fmt, ...);
+static void display_service_schedule_gaze_locked(int64_t now);
+static void display_service_schedule_blink_locked(int64_t now);
+static void display_service_stop_blink_locked(void);
+static void display_service_clear_auto_face_locked(void);
 static void display_service_start_touch_face_locked(display_face_t face, int64_t now, int64_t hold_us);
 static void display_service_clear_touch_face_locked(void);
 static void display_service_trigger_blink_locked(int64_t now,
                                                  display_blink_pattern_t pattern,
                                                  uint8_t repeat_count);
+static void display_service_update_startup_sequence_locked(int64_t now);
+static bool display_service_is_startup_sequence_active_locked(int64_t now);
+static display_face_t display_service_visual_face_preview_locked(robot_state_t state, int64_t now);
+static int64_t display_service_compute_next_render_due_locked(robot_state_t state, int64_t now);
+static void display_service_hide_momo_locked(void);
 static display_touch_zone_t display_service_touch_zone_from_point(uint16_t x, uint16_t y)
 {
     uint16_t col = (x >= ((DISPLAY_H_RES * 2U) / 3U)) ? 2U : ((x >= (DISPLAY_H_RES / 3U)) ? 1U : 0U);
@@ -323,6 +456,72 @@ static int32_t display_service_step_value_limited(int32_t current, int32_t targe
         return current - max_step;
     }
     return target;
+}
+
+static int64_t display_service_min_deadline_us(int64_t current, int64_t candidate)
+{
+    if (candidate <= 0) {
+        return current;
+    }
+    if ((current <= 0) || (candidate < current)) {
+        return candidate;
+    }
+    return current;
+}
+
+static int64_t display_service_startup_total_us(void)
+{
+    return DISPLAY_STARTUP_SLEEP_HOLD_US +
+           DISPLAY_STARTUP_PEEK_US +
+           DISPLAY_STARTUP_HALF_REVEAL_US +
+           DISPLAY_STARTUP_FULL_REVEAL_US +
+           DISPLAY_STARTUP_DROP_US;
+}
+
+static int32_t display_service_lerp_i32(int32_t start, int32_t end, int32_t progress_1000)
+{
+    if (progress_1000 <= 0) {
+        return start;
+    }
+    if (progress_1000 >= 1000) {
+        return end;
+    }
+
+    return start + (int32_t)(((int64_t)(end - start) * progress_1000) / 1000LL);
+}
+
+static int32_t display_service_ease_in_out_1000(int32_t progress_1000)
+{
+    if (progress_1000 <= 0) {
+        return 0;
+    }
+    if (progress_1000 >= 1000) {
+        return 1000;
+    }
+
+    int64_t t = progress_1000;
+    int64_t t2 = t * t;
+    int64_t t3 = t2 * t;
+    return (int32_t)(((3LL * t2 * 1000LL) - (2LL * t3)) / 1000000LL);
+}
+
+static bool display_service_is_startup_sequence_active_locked(int64_t now)
+{
+    if (s_startup_sequence_done || (s_startup_sequence_start_us <= 0)) {
+        return false;
+    }
+
+    if ((now - s_startup_sequence_start_us) >= display_service_startup_total_us()) {
+        s_startup_sequence_done = true;
+        s_last_interaction_us = now;
+        display_service_clear_auto_face_locked();
+        display_service_stop_blink_locked();
+        display_service_schedule_gaze_locked(now);
+        display_service_schedule_blink_locked(now);
+        return false;
+    }
+
+    return true;
 }
 
 static void display_service_apply_touch_zone_locked(display_touch_zone_t zone, int64_t now)
@@ -438,6 +637,188 @@ static bool display_service_is_blink_active_locked(int64_t now)
     }
 
     return true;
+}
+
+static lv_obj_t *display_service_create_pixel_block(lv_obj_t *parent,
+                                                    int16_t cell_x,
+                                                    int16_t cell_y,
+                                                    int16_t cell_w,
+                                                    int16_t cell_h,
+                                                    uint32_t color_hex)
+{
+    lv_obj_t *obj = lv_obj_create(parent);
+    lv_obj_remove_style_all(obj);
+    lv_obj_set_size(obj, cell_w * DISPLAY_MOMO_PIXEL_SIZE, cell_h * DISPLAY_MOMO_PIXEL_SIZE);
+    lv_obj_set_pos(obj, cell_x * DISPLAY_MOMO_PIXEL_SIZE, cell_y * DISPLAY_MOMO_PIXEL_SIZE);
+    lv_obj_set_style_bg_color(obj, lv_color_hex(color_hex), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+    return obj;
+}
+
+static void display_service_style_momo_feature(lv_obj_t *obj,
+                                               lv_coord_t x,
+                                               lv_coord_t y,
+                                               lv_coord_t w,
+                                               lv_coord_t h,
+                                               uint32_t color_hex,
+                                               lv_opa_t opa)
+{
+    if (opa == LV_OPA_TRANSP) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    display_service_style_rect(obj, w, h, 0, lv_color_hex(color_hex), opa);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void display_service_apply_momo_face_locked(display_momo_face_t face)
+{
+    lv_coord_t eye_y = 24;
+    lv_coord_t eye_w = 12;
+    lv_coord_t left_eye_h = 15;
+    lv_coord_t right_eye_h = 15;
+    lv_coord_t glint_y = 33;
+    lv_coord_t mouth_x = 30;
+    lv_coord_t mouth_y = 43;
+    lv_coord_t mouth_w = 12;
+    lv_coord_t mouth_h = 6;
+    lv_opa_t blush_opa = LV_OPA_TRANSP;
+    lv_opa_t glint_opa = LV_OPA_COVER;
+
+    switch (face) {
+    case DISPLAY_MOMO_FACE_SLEEP:
+        left_eye_h = 4;
+        right_eye_h = 4;
+        glint_opa = LV_OPA_TRANSP;
+        mouth_w = 12;
+        mouth_h = 4;
+        mouth_x = 30;
+        mouth_y = 46;
+        break;
+    case DISPLAY_MOMO_FACE_CURIOUS:
+        mouth_w = 9;
+        mouth_h = 4;
+        mouth_x = 31;
+        mouth_y = 46;
+        break;
+    case DISPLAY_MOMO_FACE_SHY:
+        mouth_w = 13;
+        mouth_h = 4;
+        mouth_x = 29;
+        blush_opa = LV_OPA_COVER;
+        break;
+    case DISPLAY_MOMO_FACE_SURPRISED:
+        left_eye_h = 18;
+        right_eye_h = 18;
+        eye_y = 22;
+        glint_y = 34;
+        mouth_w = 8;
+        mouth_h = 9;
+        mouth_x = 32;
+        mouth_y = 42;
+        break;
+    case DISPLAY_MOMO_FACE_BLINK:
+        left_eye_h = 4;
+        right_eye_h = 4;
+        glint_opa = LV_OPA_TRANSP;
+        mouth_w = 13;
+        mouth_h = 4;
+        mouth_x = 29;
+        blush_opa = LV_OPA_COVER;
+        break;
+    case DISPLAY_MOMO_FACE_HAPPY:
+    default:
+        mouth_w = 13;
+        mouth_h = 4;
+        mouth_x = 29;
+        blush_opa = LV_OPA_COVER;
+        break;
+    }
+
+    display_service_style_momo_feature(s_momo_left_eye, 21, eye_y, eye_w, left_eye_h, 0x21001E, LV_OPA_COVER);
+    display_service_style_momo_feature(s_momo_right_eye, 39, eye_y, eye_w, right_eye_h, 0x21001E, LV_OPA_COVER);
+    display_service_style_momo_feature(s_momo_left_glint, 27, glint_y, 6, 6, 0xD97A9D, glint_opa);
+    display_service_style_momo_feature(s_momo_right_glint, 45, glint_y, 6, 6, 0xD97A9D, glint_opa);
+    display_service_style_momo_feature(s_momo_mouth, mouth_x, mouth_y, mouth_w, mouth_h, 0xBD6A7E, LV_OPA_COVER);
+    display_service_style_momo_feature(s_momo_left_blush, 12, 36, 6, 6, 0xD97A9D, blush_opa);
+    display_service_style_momo_feature(s_momo_right_blush, 54, 36, 6, 6, 0xD97A9D, blush_opa);
+}
+
+static void display_service_hide_momo_locked(void)
+{
+    if (s_momo_root != NULL) {
+        lv_obj_add_flag(s_momo_root, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_momo_last_y = LV_COORD_MIN;
+    s_momo_last_face = -1;
+}
+
+static void display_service_update_startup_sequence_locked(int64_t now)
+{
+    if (s_momo_root == NULL) {
+        return;
+    }
+
+    if (!display_service_is_startup_sequence_active_locked(now)) {
+        display_service_hide_momo_locked();
+        return;
+    }
+
+    int64_t elapsed = now - s_startup_sequence_start_us;
+    int64_t phase_elapsed = elapsed - DISPLAY_STARTUP_SLEEP_HOLD_US;
+    lv_coord_t momo_y = DISPLAY_MOMO_HIDDEN_Y;
+    display_momo_face_t momo_face = DISPLAY_MOMO_FACE_SLEEP;
+
+    int64_t reveal_total_us = DISPLAY_STARTUP_PEEK_US +
+                              DISPLAY_STARTUP_HALF_REVEAL_US +
+                              DISPLAY_STARTUP_FULL_REVEAL_US;
+
+    if (phase_elapsed < 0) {
+        momo_y = DISPLAY_MOMO_HIDDEN_Y;
+        momo_face = DISPLAY_MOMO_FACE_SLEEP;
+    } else if (phase_elapsed < reveal_total_us) {
+        int32_t progress = display_service_ease_in_out_1000((int32_t)((phase_elapsed * 1000LL) / reveal_total_us));
+        momo_y = display_service_lerp_i32(DISPLAY_MOMO_HIDDEN_Y, DISPLAY_MOMO_FULL_Y, progress);
+
+        if (phase_elapsed < DISPLAY_STARTUP_PEEK_US) {
+            momo_face = DISPLAY_MOMO_FACE_SLEEP;
+        } else if (phase_elapsed < (DISPLAY_STARTUP_PEEK_US + DISPLAY_STARTUP_HALF_REVEAL_US)) {
+            momo_face = DISPLAY_MOMO_FACE_CURIOUS;
+        } else {
+            int64_t full_reveal_elapsed = phase_elapsed - DISPLAY_STARTUP_PEEK_US - DISPLAY_STARTUP_HALF_REVEAL_US;
+            momo_face = (full_reveal_elapsed < (DISPLAY_STARTUP_FULL_REVEAL_US / 2))
+                            ? DISPLAY_MOMO_FACE_CURIOUS
+                            : DISPLAY_MOMO_FACE_HAPPY;
+        }
+    } else {
+        phase_elapsed -= reveal_total_us;
+        int32_t progress = display_service_ease_in_out_1000((int32_t)((phase_elapsed * 1000LL) / DISPLAY_STARTUP_DROP_US));
+        momo_y = display_service_lerp_i32(DISPLAY_MOMO_FULL_Y, DISPLAY_MOMO_EXIT_Y, progress);
+
+        if (progress < 220) {
+            momo_face = DISPLAY_MOMO_FACE_HAPPY;
+        } else if (progress < 440) {
+            momo_face = DISPLAY_MOMO_FACE_BLINK;
+        } else if (progress < 700) {
+            momo_face = DISPLAY_MOMO_FACE_SURPRISED;
+        } else {
+            momo_face = DISPLAY_MOMO_FACE_SHY;
+        }
+    }
+
+    if (momo_y != s_momo_last_y) {
+        lv_obj_set_pos(s_momo_root, DISPLAY_MOMO_X, momo_y);
+        s_momo_last_y = momo_y;
+    }
+    lv_obj_clear_flag(s_momo_root, LV_OBJ_FLAG_HIDDEN);
+    if ((int32_t)momo_face != s_momo_last_face) {
+        display_service_apply_momo_face_locked(momo_face);
+        s_momo_last_face = (int32_t)momo_face;
+    }
 }
 
 static int32_t display_service_blink_openness_locked(int64_t now, bool left_eye)
@@ -563,6 +944,36 @@ static display_face_t display_service_visual_face_from_state(robot_state_t state
     return display_service_face_from_robot_state(state);
 }
 
+static display_face_t display_service_visual_face_preview_locked(robot_state_t state, int64_t now)
+{
+    if (state == ROBOT_STATE_ERROR) {
+        return DISPLAY_FACE_ERROR;
+    }
+    if (state == ROBOT_STATE_SLEEP) {
+        return DISPLAY_FACE_SLEEP;
+    }
+
+    if ((s_last_interaction_us > 0) && ((now - s_last_interaction_us) >= DISPLAY_IDLE_SLEEP_US)) {
+        return DISPLAY_FACE_SLEEP;
+    }
+
+    if ((s_touch_face != DISPLAY_FACE_NONE) &&
+        ((s_touch_face_expire_us <= 0) || (now < s_touch_face_expire_us))) {
+        return s_touch_face;
+    }
+
+    if (!display_service_state_supports_idle_animations(state)) {
+        return display_service_face_from_robot_state(state);
+    }
+
+    if ((s_auto_face != DISPLAY_FACE_NONE) &&
+        ((s_auto_face_expire_us <= 0) || (now < s_auto_face_expire_us))) {
+        return s_auto_face;
+    }
+
+    return display_service_face_from_robot_state(state);
+}
+
 static void display_service_style_rect(lv_obj_t *obj, lv_coord_t w, lv_coord_t h, lv_coord_t radius, lv_color_t color, lv_opa_t opa)
 {
     lv_obj_set_size(obj, w, h);
@@ -572,63 +983,76 @@ static void display_service_style_rect(lv_obj_t *obj, lv_coord_t w, lv_coord_t h
     lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
 }
 
-static void display_service_style_mouth_dot(lv_obj_t *obj,
-                                            lv_coord_t x,
-                                            lv_coord_t y,
-                                            lv_coord_t w,
-                                            lv_coord_t h,
-                                            lv_color_t color,
-                                            lv_opa_t opa)
+static void display_service_style_rect_cached(lv_obj_t *obj,
+                                              display_rect_cache_t *cache,
+                                              lv_coord_t x,
+                                              lv_coord_t y,
+                                              lv_coord_t w,
+                                              lv_coord_t h,
+                                              lv_coord_t radius,
+                                              lv_color_t color,
+                                              lv_opa_t opa)
 {
-    if (opa == LV_OPA_TRANSP) {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    bool hidden = (opa == LV_OPA_TRANSP);
+    uint32_t color32 = lv_color_to32(color);
+
+    if (hidden) {
+        if (!cache->initialized || !cache->hidden) {
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        }
+        cache->hidden = true;
+        cache->initialized = true;
         return;
     }
 
-    display_service_style_rect(obj, w, h, h / 2, color, opa);
-    lv_obj_set_pos(obj, x, y);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void display_service_style_eye(lv_obj_t *obj,
-                                      lv_coord_t x,
-                                      lv_coord_t y,
-                                      lv_coord_t w,
-                                      lv_coord_t h,
-                                      lv_color_t color,
-                                      lv_opa_t opa)
-{
-    if (opa == LV_OPA_TRANSP) {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-        return;
+    if (!cache->initialized || (cache->w != w) || (cache->h != h)) {
+        lv_obj_set_size(obj, w, h);
+    }
+    if (!cache->initialized || (cache->radius != radius)) {
+        lv_obj_set_style_radius(obj, radius, LV_PART_MAIN);
+    }
+    if (!cache->initialized || (cache->color32 != color32)) {
+        lv_obj_set_style_bg_color(obj, color, LV_PART_MAIN);
+    }
+    if (!cache->initialized || (cache->opa != opa)) {
+        lv_obj_set_style_bg_opa(obj, opa, LV_PART_MAIN);
+    }
+    if (!cache->initialized) {
+        lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+    }
+    if (!cache->initialized || (cache->x != x) || (cache->y != y)) {
+        lv_obj_set_pos(obj, x, y);
+    }
+    if (!cache->initialized || cache->hidden) {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
     }
 
-    display_service_style_rect(obj,
-                               w,
-                               h,
-                               LV_MIN(DISPLAY_EYE_RADIUS, LV_MIN(w / 2, h / 2)),
-                               color,
-                               opa);
-    lv_obj_set_pos(obj, x, y);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    cache->x = x;
+    cache->y = y;
+    cache->w = w;
+    cache->h = h;
+    cache->radius = radius;
+    cache->color32 = color32;
+    cache->opa = opa;
+    cache->hidden = false;
+    cache->initialized = true;
 }
 
-static void display_service_style_cheek(lv_obj_t *obj, lv_coord_t x, lv_coord_t y, lv_opa_t opa)
-{
-    if (opa == LV_OPA_TRANSP) {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-
-    display_service_style_rect(obj, 116, 40, 20, lv_color_hex(0xFF6B9D), opa);
-    lv_obj_set_pos(obj, x, y);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void display_service_style_mouth(display_mouth_t mouth, lv_color_t color)
+static void display_service_style_mouth_cached(display_mouth_t mouth, lv_color_t color)
 {
     const lv_point_t *points = NULL;
     uint32_t point_count = 0;
+    uint32_t color32 = lv_color_to32(color);
+
+    if (mouth == DISPLAY_MOUTH_NONE) {
+        if (!s_mouth_cache.initialized || !s_mouth_cache.hidden) {
+            lv_obj_add_flag(s_mouth_line, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_mouth_cache.hidden = true;
+        s_mouth_cache.initialized = true;
+        s_mouth_cache.mouth = mouth;
+        return;
+    }
 
     switch (mouth) {
     case DISPLAY_MOUTH_SMILE:
@@ -657,15 +1081,49 @@ static void display_service_style_mouth(display_mouth_t mouth, lv_color_t color)
         break;
     case DISPLAY_MOUTH_NONE:
     default:
-        lv_obj_add_flag(s_mouth_line, LV_OBJ_FLAG_HIDDEN);
+        break;
+    }
+
+    if (!s_mouth_cache.initialized || (s_mouth_cache.mouth != mouth)) {
+        lv_line_set_points(s_mouth_line, points, point_count);
+    }
+    if (!s_mouth_cache.initialized || (s_mouth_cache.color32 != color32)) {
+        lv_obj_set_style_line_color(s_mouth_line, color, LV_PART_MAIN);
+    }
+    if (!s_mouth_cache.initialized) {
+        lv_obj_set_style_line_width(s_mouth_line, 8, LV_PART_MAIN);
+        lv_obj_set_style_line_rounded(s_mouth_line, true, LV_PART_MAIN);
+    }
+    if (!s_mouth_cache.initialized || s_mouth_cache.hidden) {
+        lv_obj_clear_flag(s_mouth_line, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    s_mouth_cache.mouth = mouth;
+    s_mouth_cache.color32 = color32;
+    s_mouth_cache.hidden = false;
+    s_mouth_cache.initialized = true;
+}
+
+static void display_service_set_touch_label_locked(const char *fmt, ...)
+{
+    char text[64];
+    va_list args;
+
+    if (s_touch_label == NULL) {
         return;
     }
 
-    lv_line_set_points(s_mouth_line, points, point_count);
-    lv_obj_set_style_line_color(s_mouth_line, color, LV_PART_MAIN);
-    lv_obj_set_style_line_width(s_mouth_line, 8, LV_PART_MAIN);
-    lv_obj_set_style_line_rounded(s_mouth_line, true, LV_PART_MAIN);
-    lv_obj_clear_flag(s_mouth_line, LV_OBJ_FLAG_HIDDEN);
+    va_start(args, fmt);
+    vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+
+    if (strcmp(text, s_touch_label_text) == 0) {
+        return;
+    }
+
+    lv_label_set_text(s_touch_label, text);
+    strncpy(s_touch_label_text, text, sizeof(s_touch_label_text) - 1);
+    s_touch_label_text[sizeof(s_touch_label_text) - 1] = '\0';
 }
 
 static void display_service_expression_defaults(display_expression_t *expr, lv_color_t color)
@@ -779,6 +1237,92 @@ static void display_service_step_expression_locked(const display_expression_t *t
     s_current_expression.eye_color = target->eye_color;
 }
 
+static bool display_service_expression_matches(const display_expression_t *lhs, const display_expression_t *rhs)
+{
+    return (lhs->eye_center_y == rhs->eye_center_y) &&
+           (lhs->eye_width == rhs->eye_width) &&
+           (lhs->left_eye_height == rhs->left_eye_height) &&
+           (lhs->right_eye_height == rhs->right_eye_height) &&
+           (lhs->face_offset_x == rhs->face_offset_x) &&
+           (lhs->cheek_opa == rhs->cheek_opa) &&
+           (lhs->mouth_dot_width == rhs->mouth_dot_width) &&
+           (lhs->mouth_dot_height == rhs->mouth_dot_height) &&
+           (lhs->mouth_dot_opa == rhs->mouth_dot_opa) &&
+           (lhs->sleep_opa == rhs->sleep_opa) &&
+           (lhs->mouth == rhs->mouth) &&
+           (lv_color_to32(lhs->eye_color) == lv_color_to32(rhs->eye_color));
+}
+
+static bool display_service_face_needs_apply_locked(display_face_t face, int64_t now)
+{
+    display_expression_t target;
+    int32_t left_blink_open = display_service_blink_openness_locked(now, true);
+    int32_t right_blink_open = display_service_blink_openness_locked(now, false);
+
+    if (!s_expression_ready) {
+        return true;
+    }
+    if ((s_last_left_blink_open != left_blink_open) || (s_last_right_blink_open != right_blink_open)) {
+        return true;
+    }
+
+    display_service_fill_expression_locked(face, &target);
+    return !display_service_expression_matches(&s_current_expression, &target);
+}
+
+static int64_t display_service_compute_next_render_due_locked(robot_state_t state, int64_t now)
+{
+    int64_t next_due = 0;
+
+    if (display_service_is_startup_sequence_active_locked(now)) {
+        return now + DISPLAY_ACTIVE_RENDER_INTERVAL_US;
+    }
+    if (s_touch_pressed || display_service_is_blink_active_locked(now)) {
+        return now + DISPLAY_ACTIVE_RENDER_INTERVAL_US;
+    }
+
+    display_face_t preview_face = display_service_visual_face_preview_locked(state, now);
+    if (display_service_face_needs_apply_locked(preview_face, now)) {
+        return now + DISPLAY_ACTIVE_RENDER_INTERVAL_US;
+    }
+
+    if (!s_long_press_triggered && (s_touch_press_started_us > 0)) {
+        next_due = display_service_min_deadline_us(next_due,
+                                                   s_touch_press_started_us + DISPLAY_TOUCH_LONG_PRESS_US);
+    }
+    if (s_touch_ready && (s_touch_handle != NULL)) {
+        if (!s_touch_sample_valid || (s_next_touch_poll_us <= now)) {
+            return now;
+        }
+        next_due = display_service_min_deadline_us(next_due, s_next_touch_poll_us);
+    }
+    if ((s_touch_face != DISPLAY_FACE_NONE) && (s_touch_face_expire_us > now)) {
+        next_due = display_service_min_deadline_us(next_due, s_touch_face_expire_us);
+    }
+    if ((s_auto_face != DISPLAY_FACE_NONE) && (s_auto_face_expire_us > now)) {
+        next_due = display_service_min_deadline_us(next_due, s_auto_face_expire_us);
+    }
+    if ((s_last_interaction_us > 0) && ((s_last_interaction_us + DISPLAY_IDLE_SLEEP_US) > now)) {
+        next_due = display_service_min_deadline_us(next_due, s_last_interaction_us + DISPLAY_IDLE_SLEEP_US);
+    }
+    if (display_service_state_supports_idle_animations(state) && !s_touch_pressed) {
+        if ((s_next_gaze_us > 0) && (s_next_gaze_us <= now)) {
+            return now;
+        }
+        if ((s_next_blink_us > 0) && (s_next_blink_us <= now)) {
+            return now;
+        }
+        next_due = display_service_min_deadline_us(next_due, s_next_gaze_us);
+        next_due = display_service_min_deadline_us(next_due, s_next_blink_us);
+    }
+
+    if (next_due <= 0) {
+        next_due = now + DISPLAY_RENDER_HEARTBEAT_US;
+    }
+
+    return next_due;
+}
+
 static void display_service_apply_face_locked(display_face_t face, int64_t now)
 {
     display_expression_t target;
@@ -797,40 +1341,109 @@ static void display_service_apply_face_locked(display_face_t face, int64_t now)
     int32_t left_eye_y = s_current_expression.eye_center_y - (left_eye_height_blinked / 2);
     int32_t right_eye_y = s_current_expression.eye_center_y - (right_eye_height_blinked / 2);
 
-    lv_obj_set_pos(s_face_root, s_current_expression.face_offset_x, 0);
+    s_last_left_blink_open = left_blink_open;
+    s_last_right_blink_open = right_blink_open;
 
-    display_service_style_eye(s_left_eye,
-                              left_eye_x,
-                              left_eye_y,
-                              s_current_expression.eye_width,
-                              left_eye_height_blinked,
-                              s_current_expression.eye_color,
-                              LV_OPA_COVER);
-    display_service_style_eye(s_right_eye,
-                              right_eye_x,
-                              right_eye_y,
-                              s_current_expression.eye_width,
-                              right_eye_height_blinked,
-                              s_current_expression.eye_color,
-                              LV_OPA_COVER);
+    if (s_face_root_last_x != s_current_expression.face_offset_x) {
+        lv_obj_set_pos(s_face_root, s_current_expression.face_offset_x, 0);
+        s_face_root_last_x = s_current_expression.face_offset_x;
+    }
 
-    display_service_style_cheek(s_left_cheek, 104, 280, (lv_opa_t)s_current_expression.cheek_opa);
-    display_service_style_cheek(s_right_cheek, 580, 280, (lv_opa_t)s_current_expression.cheek_opa);
-    display_service_style_mouth(s_current_expression.mouth, s_current_expression.eye_color);
-    display_service_style_mouth_dot(s_mouth_dot,
-                                    400 - (s_current_expression.mouth_dot_width / 2),
-                                    336,
-                                    s_current_expression.mouth_dot_width,
-                                    s_current_expression.mouth_dot_height,
-                                    s_current_expression.eye_color,
-                                    (lv_opa_t)s_current_expression.mouth_dot_opa);
+    display_service_style_rect_cached(s_left_eye,
+                                      &s_left_eye_cache,
+                                      left_eye_x,
+                                      left_eye_y,
+                                      s_current_expression.eye_width,
+                                      left_eye_height_blinked,
+                                      LV_MIN(DISPLAY_EYE_RADIUS,
+                                             LV_MIN(s_current_expression.eye_width / 2, left_eye_height_blinked / 2)),
+                                      s_current_expression.eye_color,
+                                      LV_OPA_COVER);
+    display_service_style_rect_cached(s_right_eye,
+                                      &s_right_eye_cache,
+                                      right_eye_x,
+                                      right_eye_y,
+                                      s_current_expression.eye_width,
+                                      right_eye_height_blinked,
+                                      LV_MIN(DISPLAY_EYE_RADIUS,
+                                             LV_MIN(s_current_expression.eye_width / 2, right_eye_height_blinked / 2)),
+                                      s_current_expression.eye_color,
+                                      LV_OPA_COVER);
+
+    display_service_style_rect_cached(s_left_cheek,
+                                      &s_left_cheek_cache,
+                                      104,
+                                      280,
+                                      116,
+                                      40,
+                                      20,
+                                      lv_color_hex(0xFF6B9D),
+                                      (lv_opa_t)s_current_expression.cheek_opa);
+    display_service_style_rect_cached(s_right_cheek,
+                                      &s_right_cheek_cache,
+                                      580,
+                                      280,
+                                      116,
+                                      40,
+                                      20,
+                                      lv_color_hex(0xFF6B9D),
+                                      (lv_opa_t)s_current_expression.cheek_opa);
+    display_service_style_mouth_cached(s_current_expression.mouth, s_current_expression.eye_color);
+    display_service_style_rect_cached(s_mouth_dot,
+                                      &s_mouth_dot_cache,
+                                      400 - (s_current_expression.mouth_dot_width / 2),
+                                      336,
+                                      s_current_expression.mouth_dot_width,
+                                      s_current_expression.mouth_dot_height,
+                                      s_current_expression.mouth_dot_height / 2,
+                                      s_current_expression.eye_color,
+                                      (lv_opa_t)s_current_expression.mouth_dot_opa);
 
     if (s_current_expression.sleep_opa == LV_OPA_TRANSP) {
-        lv_obj_add_flag(s_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        if (!s_sleep_label_hidden) {
+            lv_obj_add_flag(s_sleep_label, LV_OBJ_FLAG_HIDDEN);
+            s_sleep_label_hidden = true;
+        }
     } else {
-        lv_obj_set_style_text_opa(s_sleep_label, (lv_opa_t)s_current_expression.sleep_opa, LV_PART_MAIN);
-        lv_obj_clear_flag(s_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        if (s_sleep_label_last_opa != s_current_expression.sleep_opa) {
+            lv_obj_set_style_text_opa(s_sleep_label, (lv_opa_t)s_current_expression.sleep_opa, LV_PART_MAIN);
+            s_sleep_label_last_opa = s_current_expression.sleep_opa;
+        }
+        if (s_sleep_label_hidden) {
+            lv_obj_clear_flag(s_sleep_label, LV_OBJ_FLAG_HIDDEN);
+            s_sleep_label_hidden = false;
+        }
     }
+}
+
+static void display_service_refresh_touch_sample_locked(int64_t now)
+{
+    if (s_touch_sample_valid && (s_next_touch_poll_us > now)) {
+        return;
+    }
+
+    s_next_touch_poll_us = now + DISPLAY_TOUCH_POLL_INTERVAL_US;
+    s_touch_sample_valid = false;
+    s_touch_sample_pressed = false;
+    s_touch_sample_points = 0;
+
+    esp_err_t err = esp_lcd_touch_read_data(s_touch_handle);
+    if (err != ESP_OK) {
+        display_service_set_touch_label_locked("Touch: read error");
+        return;
+    }
+
+    uint16_t touch_strength = 0;
+    bool touched = esp_lcd_touch_get_coordinates(s_touch_handle,
+                                                 &s_touch_sample_x,
+                                                 &s_touch_sample_y,
+                                                 &touch_strength,
+                                                 &s_touch_sample_points,
+                                                 1);
+    (void)touch_strength;
+
+    s_touch_sample_valid = true;
+    s_touch_sample_pressed = touched && (s_touch_sample_points > 0);
 }
 
 static esp_err_t display_service_i2c_init(void)
@@ -1078,38 +1691,41 @@ static void display_service_update_touch_locked(void)
 {
     int64_t now = esp_timer_get_time();
 
-    if (s_touch_label == NULL) {
+    if (display_service_is_startup_sequence_active_locked(now)) {
+        display_service_set_touch_label_locked("Touch: startup");
+        s_touch_pressed = false;
+        s_touch_press_started_us = 0;
+        s_long_press_triggered = false;
+        s_touch_active_zone = DISPLAY_TOUCH_ZONE_NONE;
+        s_touch_sample_valid = false;
+        s_touch_sample_pressed = false;
+        s_touch_sample_points = 0;
+        s_next_touch_poll_us = 0;
         return;
     }
 
     if (!s_touch_ready || (s_touch_handle == NULL)) {
-        lv_label_set_text(s_touch_label, "Touch: unavailable");
+        display_service_set_touch_label_locked("Touch: unavailable");
+        s_touch_pressed = false;
+        s_touch_sample_valid = false;
+        s_touch_sample_pressed = false;
+        s_touch_sample_points = 0;
+        s_next_touch_poll_us = 0;
         return;
     }
 
-    esp_err_t err = esp_lcd_touch_read_data(s_touch_handle);
-    if (err != ESP_OK) {
-        lv_label_set_text(s_touch_label, "Touch: read error");
-        return;
-    }
+    display_service_refresh_touch_sample_locked(now);
 
-    uint16_t touch_x = 0;
-    uint16_t touch_y = 0;
-    uint16_t touch_strength = 0;
-    uint8_t touch_points = 0;
+    uint16_t touch_x = s_touch_sample_x;
+    uint16_t touch_y = s_touch_sample_y;
+    uint8_t touch_points = s_touch_sample_points;
     display_touch_zone_t zone = DISPLAY_TOUCH_ZONE_NONE;
-    bool touched = esp_lcd_touch_get_coordinates(s_touch_handle,
-                                                 &touch_x,
-                                                 &touch_y,
-                                                 &touch_strength,
-                                                 &touch_points,
-                                                 1);
+    bool touched = s_touch_sample_valid && s_touch_sample_pressed;
 
     if (touched && (touch_points > 0)) {
         zone = display_service_touch_zone_from_point(touch_x, touch_y);
         s_last_interaction_us = now;
         s_touch_active_zone = zone;
-        (void)touch_strength;
 
         if (!s_touch_pressed) {
             s_touch_press_started_us = now;
@@ -1129,13 +1745,12 @@ static void display_service_update_touch_locked(void)
             s_long_press_triggered = true;
         }
 
-        lv_label_set_text_fmt(s_touch_label,
-                              "Touch: pressed (%u, %u) [%s]",
-                              touch_x,
-                              touch_y,
-                              display_service_touch_zone_name(zone));
+        display_service_set_touch_label_locked("Touch: pressed (%u, %u) [%s]",
+                                               touch_x,
+                                               touch_y,
+                                               display_service_touch_zone_name(zone));
     } else {
-        lv_label_set_text(s_touch_label, "Touch: released");
+        display_service_set_touch_label_locked("Touch: released");
         s_touch_press_started_us = 0;
         s_long_press_triggered = false;
         s_touch_active_zone = DISPLAY_TOUCH_ZONE_NONE;
@@ -1146,14 +1761,37 @@ static void display_service_update_touch_locked(void)
 
 static void display_service_update_ui_locked(robot_state_t state, int64_t now)
 {
+    display_service_update_startup_sequence_locked(now);
+
+    if (display_service_is_startup_sequence_active_locked(now)) {
+        if ((s_last_status_face != DISPLAY_FACE_SLEEP) || !s_expression_ready) {
+            display_service_apply_face_locked(DISPLAY_FACE_SLEEP, now);
+        }
+        if ((s_last_status_face != DISPLAY_FACE_SLEEP) || (state != s_last_status_state)) {
+            if (s_state_label != NULL) {
+                lv_label_set_text_fmt(s_state_label,
+                                      "Face: %s | Link: %s | Intro: momo",
+                                      display_service_face_name(DISPLAY_FACE_SLEEP),
+                                      emotion_engine_state_name(state));
+            }
+            s_last_status_face = DISPLAY_FACE_SLEEP;
+            s_last_status_state = state;
+        }
+        return;
+    }
+
     display_face_t face = display_service_visual_face_from_state(state, now);
 
-    display_service_apply_face_locked(face, now);
+    if (display_service_face_needs_apply_locked(face, now)) {
+        display_service_apply_face_locked(face, now);
+    }
     if ((face != s_last_status_face) || (state != s_last_status_state)) {
-        lv_label_set_text_fmt(s_state_label,
-                              "Face: %s | Link: %s",
-                              display_service_face_name(face),
-                              emotion_engine_state_name(state));
+        if (s_state_label != NULL) {
+            lv_label_set_text_fmt(s_state_label,
+                                  "Face: %s | Link: %s",
+                                  display_service_face_name(face),
+                                  emotion_engine_state_name(state));
+        }
         s_last_status_face = face;
         s_last_status_state = state;
     }
@@ -1191,23 +1829,45 @@ static void display_service_create_ui(void)
     lv_obj_set_style_text_color(s_sleep_label, lv_color_hex(0xA78BFA), LV_PART_MAIN);
     lv_obj_align(s_sleep_label, LV_ALIGN_TOP_RIGHT, -72, 34);
 
-    s_state_label = lv_label_create(scr);
-    lv_label_set_text(s_state_label, "Face: happy");
-    lv_obj_set_style_text_color(s_state_label, lv_color_hex(0xE2E8F0), LV_PART_MAIN);
-    lv_obj_align(s_state_label, LV_ALIGN_BOTTOM_MID, 0, -42);
+    s_state_label = NULL;
+    s_hint_label = NULL;
+    s_touch_label = NULL;
 
-    s_hint_label = lv_label_create(scr);
-    lv_label_set_text(s_hint_label,
-                      "TL=lookL TM=shy TR=lookR | ML=listen MM=happy MR=proc | BL=blink BM=speak BR=sleep | Hold=excited");
-    lv_obj_set_style_text_color(s_hint_label, lv_color_hex(0x94A3B8), LV_PART_MAIN);
-    lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, -24);
+    s_momo_root = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_momo_root);
+    lv_obj_set_size(s_momo_root, DISPLAY_MOMO_WIDTH, DISPLAY_MOMO_HEIGHT);
+    lv_obj_set_pos(s_momo_root, DISPLAY_MOMO_X, DISPLAY_MOMO_HIDDEN_Y);
+    lv_obj_clear_flag(s_momo_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(s_momo_root, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_momo_root, 0, LV_PART_MAIN);
 
-    s_touch_label = lv_label_create(scr);
-    lv_label_set_text(s_touch_label, s_touch_ready ? "Touch: ready" : "Touch: unavailable");
-    lv_obj_set_style_text_color(s_touch_label, lv_color_hex(0xCBD5E1), LV_PART_MAIN);
-    lv_obj_align(s_touch_label, LV_ALIGN_BOTTOM_MID, 0, -6);
+    for (size_t i = 0; i < (sizeof(s_momo_body_blocks) / sizeof(s_momo_body_blocks[0])); ++i) {
+        const display_pixel_block_t *block = &s_momo_body_blocks[i];
+        (void)display_service_create_pixel_block(s_momo_root,
+                                                 block->x,
+                                                 block->y,
+                                                 block->w,
+                                                 block->h,
+                                                 block->color_hex);
+    }
+
+    s_momo_left_eye = lv_obj_create(s_momo_root);
+    s_momo_right_eye = lv_obj_create(s_momo_root);
+    s_momo_left_glint = lv_obj_create(s_momo_root);
+    s_momo_right_glint = lv_obj_create(s_momo_root);
+    s_momo_mouth = lv_obj_create(s_momo_root);
+    s_momo_left_blush = lv_obj_create(s_momo_root);
+    s_momo_right_blush = lv_obj_create(s_momo_root);
+
+    lv_obj_add_flag(s_momo_root, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_momo_left_glint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_momo_right_glint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_momo_left_blush, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_momo_right_blush, LV_OBJ_FLAG_HIDDEN);
 
     s_last_interaction_us = esp_timer_get_time();
+    s_startup_sequence_start_us = s_last_interaction_us;
+    s_startup_sequence_done = false;
     display_service_schedule_gaze_locked(s_last_interaction_us);
     display_service_schedule_blink_locked(s_last_interaction_us);
     display_service_update_ui_locked(ROBOT_STATE_BOOTING, s_last_interaction_us);
@@ -1257,12 +1917,22 @@ void display_service_render(robot_state_t state)
 {
     static robot_state_t last_state = ROBOT_STATE_BOOTING;
     bool state_changed = (state != last_state);
+    int64_t now = esp_timer_get_time();
+
+    if (s_display_ready &&
+        (!state_changed) &&
+        (s_next_render_due_us > 0) &&
+        (now < s_next_render_due_us)) {
+        last_state = state;
+        return;
+    }
 
     if (s_display_ready && lvgl_port_lock(0)) {
         display_service_update_touch_locked();
 
-        int64_t now = esp_timer_get_time();
+        now = esp_timer_get_time();
         display_service_update_ui_locked(state, now);
+        s_next_render_due_us = display_service_compute_next_render_due_locked(state, now);
         lvgl_port_unlock();
     }
 
