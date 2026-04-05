@@ -1,0 +1,238 @@
+
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+.wrap { font-family: var(--font-sans); }
+.screen-sim {
+  background: #000; border-radius: 10px; border: 2px solid #333;
+  width: 100%; aspect-ratio: 800/480; max-width: 640px;
+  margin: 0 auto 8px; display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden; cursor: pointer;
+}
+.face-row { display: flex; gap: 7px; flex-wrap: wrap; justify-content: center; margin-bottom: 6px; }
+.thumb {
+  background: #000; border-radius: 6px; border: 1.5px solid #333;
+  width: 92px; height: 56px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: border-color 0.15s; flex-shrink: 0;
+}
+.thumb:hover { border-color: #3aff90; }
+.thumb.active { border-color: #3aff90; border-width: 2px; }
+.thumb svg { width: 84px; height: 50px; }
+.meta { text-align: center; margin-bottom: 6px; }
+.meta-name { font-size: 13px; font-weight: 500; color: var(--color-text-primary); }
+.meta-desc { font-size: 11px; color: var(--color-text-secondary); margin-top: 2px; }
+.section-title { font-size: 11px; color: var(--color-text-secondary); margin: 8px 0 5px; font-weight: 500; text-align: center; }
+.hint { font-size: 10px; color: #3aff90; text-align: center; margin-bottom: 8px; opacity: 0.7; }
+</style>
+
+<div class="wrap">
+  <div class="screen-sim" id="mainScreen">
+    <svg id="mainSvg" viewBox="0 0 800 480" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+  <div class="meta">
+    <div class="meta-name" id="mName">开心（默认）</div>
+    <div class="meta-desc" id="mDesc">上电默认状态</div>
+  </div>
+  <div class="hint">点击大图 / 缩略图切换预览</div>
+
+  <div class="section-title">── 触摸交互 ──</div>
+  <div class="face-row" id="row1"></div>
+  <div class="section-title">── 自动行为 ──</div>
+  <div class="face-row" id="row2"></div>
+</div>
+
+<script>
+const W=800, H=480, CX=400, CY=240;
+
+// 眼睛参数：间距拉大一点点，改成圆角矩形
+const EYE_W = 120;   // 眼睛宽
+const EYE_H = 160;   // 眼睛高
+const EYE_R = 52;    // 圆角半径
+const LX = CX - 170; // 左眼中心X（间距比之前宽）
+const RX = CX + 170; // 右眼中心X
+const EY = CY - 30;  // 眼睛中心Y
+
+// 发光滤镜
+const DEFS = `<defs>
+  <filter id="eg" x="-60%" y="-60%" width="220%" height="220%">
+    <feGaussianBlur stdDeviation="16" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="er" x="-60%" y="-60%" width="220%" height="220%">
+    <feGaussianBlur stdDeviation="12" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="ez" x="-60%" y="-60%" width="220%" height="220%">
+    <feGaussianBlur stdDeviation="10" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>`;
+
+// 画圆角矩形眼睛（支持宽高缩放，整体平移）
+function rectEye(cx, cy, w, h, r, color, scaleY=1, dx=0, dy=0, extra='') {
+  const rh = h * scaleY;
+  const x = cx - w/2 + dx;
+  const y = cy - rh/2 + dy;
+  const rr = Math.min(r, rh/2);
+  return `<rect x="${x}" y="${y}" width="${w}" height="${rh}" rx="${rr}" ry="${rr}" fill="${color}" filter="url(#eg)" ${extra}/>`;
+}
+
+// 眼白高光
+function highlight(cx, cy, scaleY=1, dx=0, dy=0) {
+  const rh = EYE_H * scaleY;
+  return `<ellipse cx="${cx + dx + EYE_W*0.22}" cy="${cy + dy - rh*0.28}" rx="${EYE_W*0.2}" ry="${Math.min(rh*0.14, 18)}" fill="white" opacity="0.32"/>`;
+}
+
+// 瞳孔（小矩形，叠在眼睛上方）
+function pupil(cx, cy, dx=0, dy=0, scaleY=1) {
+  const pw = 36, ph = 54 * scaleY;
+  const x = cx + dx - pw/2;
+  const y = cy + dy - ph/2;
+  return `<rect x="${x}" y="${y}" width="${pw}" height="${ph}" rx="14" fill="white" opacity="0.18"/>`;
+}
+
+// 嘴巴
+function smile(color='#39ff6e', yOff=0) {
+  return `<path d="M ${CX-55} ${CY+112+yOff} Q ${CX} ${CY+148+yOff} ${CX+55} ${CY+112+yOff}" stroke="${color}" stroke-width="9" fill="none" stroke-linecap="round" filter="url(#eg)"/>`;
+}
+function wave(color='#39ff6e') {
+  return `<path d="M ${CX-68} ${CY+115} Q ${CX-22} ${CY+100} ${CX} ${CY+118} Q ${CX+22} ${CY+136} ${CX+68} ${CY+122}" stroke="${color}" stroke-width="8" fill="none" stroke-linecap="round" filter="url(#eg)"/>`;
+}
+
+// 腮红
+function blush(color='#ff6b9d', op=0.32) {
+  return `
+    <ellipse cx="${LX-60}" cy="${EY+60}" rx="58" ry="20" fill="${color}" opacity="${op}" filter="url(#er)"/>
+    <ellipse cx="${RX+60}" cy="${EY+60}" rx="58" ry="20" fill="${color}" opacity="${op}" filter="url(#er)"/>`;
+}
+
+// ZZZ
+function zzz() {
+  return `
+    <text x="625" y="72" font-size="28" fill="#a78bfa" filter="url(#ez)" font-family="sans-serif" font-weight="700" opacity="0.55">z</text>
+    <text x="656" y="46" font-size="36" fill="#a78bfa" filter="url(#ez)" font-family="sans-serif" font-weight="700" opacity="0.75">z</text>
+    <text x="694" y="18" font-size="46" fill="#a78bfa" filter="url(#ez)" font-family="sans-serif" font-weight="700">Z</text>`;
+}
+
+const G = '#39ff6e';
+
+const faces = [
+  // ── 触摸交互 ──
+  {
+    id:'happy', name:'开心（默认）', desc:'上电 / 触摸屏幕中间', row:'touch',
+    svg() {
+      return DEFS +
+        rectEye(LX, EY, EYE_W, EYE_H, EYE_R, G) +
+        rectEye(RX, EY, EYE_W, EYE_H, EYE_R, G) +
+        highlight(LX, EY) + highlight(RX, EY) +
+        smile();
+    }
+  },
+  {
+    id:'shy_top', name:'害羞', desc:'触摸屏幕上方', row:'touch',
+    svg() {
+      // 眼睛缩成半高 + 向下偏 + 腮红 + wave嘴
+      return DEFS +
+        rectEye(LX, EY, EYE_W, EYE_H, EYE_R, G, 0.45, 0, 20) +
+        rectEye(RX, EY, EYE_W, EYE_H, EYE_R, G, 0.45, 0, 20) +
+        blush() +
+        wave();
+    }
+  },
+  {
+    id:'shy_mid', name:'恢复开心', desc:'触摸屏幕中间', row:'touch',
+    svg() {
+      return DEFS +
+        rectEye(LX, EY, EYE_W, EYE_H, EYE_R, G) +
+        rectEye(RX, EY, EYE_W, EYE_H, EYE_R, G) +
+        highlight(LX, EY) + highlight(RX, EY) +
+        smile();
+    }
+  },
+  {
+    id:'excited', name:'兴奋', desc:'长按 1.5 秒', row:'touch',
+    svg() {
+      const bh = EYE_H * 1.1;
+      return DEFS +
+        rectEye(LX, EY-10, EYE_W*1.05, bh, EYE_R, G) +
+        rectEye(RX, EY-10, EYE_W*1.05, bh, EYE_R, G) +
+        highlight(LX, EY-10, 1.1) + highlight(RX, EY-10, 1.1) +
+        `<ellipse cx="${CX}" cy="${CY+128}" rx="52" ry="26" fill="${G}" filter="url(#eg)"/>`;
+    }
+  },
+
+  // ── 自动行为 ──
+  {
+    id:'lookleft', name:'看左', desc:'每3~6秒随机触发', row:'auto',
+    // 瞳孔（高光）大幅向左偏移，眼白只剩右侧
+    svg() {
+      const shift = -46; // 大幅向左
+      return DEFS +
+        rectEye(LX, EY, EYE_W, EYE_H, EYE_R, G) +
+        rectEye(RX, EY, EYE_W, EYE_H, EYE_R, G) +
+        // 高光向左
+        highlight(LX, EY, 1, shift-EYE_W*0.44, 0) +
+        highlight(RX, EY, 1, shift-EYE_W*0.44, 0) +
+        // 暗遮罩在右侧制造方向感
+        `<rect x="${LX - EYE_W/2 + 28}" y="${EY - EYE_H/2}" width="${EYE_W - 28}" height="${EYE_H}" rx="${EYE_R}" fill="rgba(0,0,0,0.55)"/>` +
+        `<rect x="${RX - EYE_W/2 + 28}" y="${EY - EYE_H/2}" width="${EYE_W - 28}" height="${EYE_H}" rx="${EYE_R}" fill="rgba(0,0,0,0.55)"/>`;
+    }
+  },
+  {
+    id:'lookright', name:'看右', desc:'每3~6秒随机触发', row:'auto',
+    svg() {
+      return DEFS +
+        rectEye(LX, EY, EYE_W, EYE_H, EYE_R, G) +
+        rectEye(RX, EY, EYE_W, EYE_H, EYE_R, G) +
+        highlight(LX, EY, 1, EYE_W*0.44, 0) +
+        highlight(RX, EY, 1, EYE_W*0.44, 0) +
+        `<rect x="${LX - EYE_W/2}" y="${EY - EYE_H/2}" width="${EYE_W - 28}" height="${EYE_H}" rx="${EYE_R}" fill="rgba(0,0,0,0.55)"/>` +
+        `<rect x="${RX - EYE_W/2}" y="${EY - EYE_H/2}" width="${EYE_W - 28}" height="${EYE_H}" rx="${EYE_R}" fill="rgba(0,0,0,0.55)"/>`;
+    }
+  },
+  {
+    id:'blink', name:'眨眼', desc:'10~20秒随机', row:'auto',
+    svg() {
+      return DEFS +
+        rectEye(LX, EY, EYE_W, 14, 7, G) +
+        rectEye(RX, EY, EYE_W, EYE_H, EYE_R, G) +
+        highlight(RX, EY) +
+        `<path d="M ${CX-45} ${CY+112} Q ${CX+10} ${CY+140} ${CX+55} ${CY+108}" stroke="${G}" stroke-width="8" fill="none" stroke-linecap="round" filter="url(#eg)"/>`;
+    }
+  },
+  {
+    id:'sleeping', name:'待机睡眠', desc:'3分钟无操作，任意触摸唤醒', row:'auto',
+    svg() {
+      return DEFS +
+        `<rect x="${LX - EYE_W/2}" y="${EY - 10}" width="${EYE_W}" height="20" rx="10" fill="${G}" filter="url(#eg)"/>` +
+        `<rect x="${RX - EYE_W/2}" y="${EY - 10}" width="${EYE_W}" height="20" rx="10" fill="${G}" filter="url(#eg)"/>` +
+        zzz();
+    }
+  },
+];
+
+let current = 0;
+function setMain(idx) {
+  current = idx;
+  const f = faces[idx];
+  document.getElementById('mainSvg').innerHTML = f.svg();
+  document.getElementById('mName').textContent = f.name;
+  document.getElementById('mDesc').textContent = f.desc;
+  document.querySelectorAll('.thumb').forEach((t,i) => t.classList.toggle('active', i===idx));
+}
+document.getElementById('mainScreen').onclick = () => setMain((current+1) % faces.length);
+
+['touch','auto'].forEach((row, ri) => {
+  const arr = faces.filter(f => f.row===row);
+  const rowEl = document.getElementById('row'+(ri+1));
+  arr.forEach(f => {
+    const div = document.createElement('div');
+    div.className = 'thumb';
+    div.innerHTML = `<svg viewBox="0 0 800 480" xmlns="http://www.w3.org/2000/svg">${f.svg()}</svg>`;
+    div.onclick = () => setMain(faces.indexOf(f));
+    rowEl.appendChild(div);
+  });
+});
+setMain(0);
+document.querySelectorAll('.thumb')[0].classList.add('active');
+</script>

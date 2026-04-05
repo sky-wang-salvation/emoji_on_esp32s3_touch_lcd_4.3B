@@ -1,0 +1,5 @@
+dependencies:
+  ESP32_Display_Panel:
+    version: '*'
+  lvgl/lvgl:
+    version: ^8

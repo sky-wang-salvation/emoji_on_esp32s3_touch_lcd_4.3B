@@ -1,0 +1,6 @@
+.DS_Store
+.cache/
+build/
+sdkconfig.old
+dependencies.lock.old
+.vscode/
